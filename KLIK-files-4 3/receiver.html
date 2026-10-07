@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyDeck Receiver</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body{align-items:center;justify-content:center;text-align:center;gap:18px;overflow:auto}
+  h1{font-size:clamp(28px,5vw,48px);letter-spacing:2px;margin:0}
+  .line{font-size:clamp(20px,3vw,30px)}
+  #last{font-size:clamp(28px,5vw,48px);margin-top:10px}
+  #act{background:var(--ac);border-radius:18px;padding:18px 28px;font-size:22px;font-weight:700}
+</style>
+</head>
+<body>
+<h1>MYDECK RECEIVER</h1>
+<div class="line" id="l-tab">🔴 Tablet desconectada</div>
+<div class="line" id="l-dis">🎙️ Discord Web no conectado</div>
+<div class="line" id="l-snd">🔴 Audio no activado</div>
+<div class="line" id="l-err" hidden></div>
+<div class="mut" id="l-sto" hidden></div>
+<button id="act">🔊 Activar audio (obligatorio, un clic)</button>
+<div class="mut">Última acción:</div>
+<div id="last">—</div>
+<div class="mut" id="net">Conectando…</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const key = new URLSearchParams(location.search).get('key') || localStorage.getItem('mydeckKey') || prompt('PIN de MyDeck') || '';
+localStorage.setItem('mydeckKey', key);
+let ws, config = null, ctx = null, master = null, st = null;
+const active = new Set(), buffers = new Map();
+let diag = null; // último error real: { msg, file }
+function fail(where, msg, report = true, file = null) {
+  diag = { msg, file }; console.error('[KLIK receiver] ' + where + ':', msg); ui();
+  if (report && ws?.readyState === 1) ws.send(JSON.stringify({ type: 'receiver.error', where, message: msg }));
+}
+
+// ---- IndexedDB: caché local de los audios en esta computadora ----
+const idb = new Promise((res, rej) => { const r = indexedDB.open('mydeck-audio', 1); r.onupgradeneeded = () => r.result.createObjectStore('files', { keyPath: 'file' }); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const tx = async (mode, fn) => { const db = await idb; return new Promise((res, rej) => { const q = fn(db.transaction('files', mode).objectStore('files')); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+
+class KErr extends Error { constructor(kind, msg) { super(msg); this.kind = kind; } }
+async function getBuffer(file) {
+  if (buffers.has(file)) return buffers.get(file);
+  if (!ctx) throw new KErr('audio', 'Audio no activado: pulsa "Activar audio" en el receptor');
+  let data = null, fromCache = false;
+  try { data = (await tx('readonly', (s) => s.get(file)))?.data || null; fromCache = !!data; }
+  catch (e) { console.warn('[KLIK receiver] IndexedDB no disponible, se descarga sin caché:', e); }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!data) {
+      let r;
+      console.log('[KLIK receiver] descargando', file);
+      try { r = await fetch('/sounds/' + encodeURIComponent(file) + '?key=' + encodeURIComponent(key)); }
+      catch (e) { throw new KErr('download', `Error descargando sonido: sin conexión con el servidor (${e.message})`); }
+      if (r.status === 404) throw new KErr('missing', `Archivo de sonido no encontrado en el servidor (${file}). Render suele borrarlo al reiniciar: súbelo otra vez desde la tablet`);
+      if (r.status === 401) throw new KErr('download', 'Error descargando sonido: PIN incorrecto');
+      if (!r.ok) throw new KErr('download', `Error descargando sonido: HTTP ${r.status}`);
+      data = await r.arrayBuffer(); fromCache = false;
+      if (!data.byteLength) throw new KErr('download', `Error descargando sonido: el archivo llegó vacío (${file})`);
+    }
+    try {
+      const buf = await ctx.decodeAudioData(data.slice(0));
+      buffers.set(file, buf);
+      if (!fromCache) tx('readwrite', (s) => s.put({ file, data })).catch((e) => console.warn('[KLIK receiver] no se pudo guardar en caché:', e));
+      return buf;
+    } catch (e) {
+      console.warn('[KLIK receiver] decodeAudioData falló para', file, e);
+      if (fromCache) { await tx('readwrite', (s) => s.delete(file)).catch(() => {}); data = null; fromCache = false; continue; } // caché dañada: reintenta descargando
+      throw new KErr('decode', `Error decodificando audio (${file}): formato no soportado o archivo dañado`);
+    }
+  }
+}
+async function syncCache() {
+  if (!config) return;
+  const files = config.slots.map((s) => s.file).filter(Boolean);
+  let stored = [];
+  try { stored = await tx('readonly', (s) => s.getAllKeys()); } catch (e) { console.warn('[KLIK receiver] IndexedDB:', e); }
+  if (files.length) { for (const k of stored) if (!files.includes(k)) { await tx('readwrite', (s) => s.delete(k)).catch(() => {}); buffers.delete(k); } }
+  else if (stored.length) console.warn('[KLIK receiver] el servidor no tiene ningún sonido configurado; se conserva la copia local (' + stored.length + ' archivos)');
+  if (ctx) for (const f of files) getBuffer(f).then(() => { if (diag && diag.file === f) { diag = null; ui(); } }).catch((e) => fail(e.kind || 'precarga', e.message, false, f));
+}
+
+// ---- Audio ----
+const audioReady = () => !!ctx && ctx.state === 'running';
+function status() { ws?.readyState === 1 && ws.send(JSON.stringify({ type: 'receiver.status', audioReady: audioReady() })); ui(); }
+$('act').onclick = async () => {
+  try {
+    ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+    master = master || ctx.createGain(); master.connect(ctx.destination);
+    master.gain.value = (config?.master ?? 100) / 100;
+    await ctx.resume();
+    console.log('[KLIK receiver] AudioContext:', ctx.state, '| sampleRate', ctx.sampleRate);
+    ctx.onstatechange = () => { console.log('[KLIK receiver] AudioContext ->', ctx.state); status(); };
+    await syncCache(); status();
+  } catch (e) { fail('audio', 'Audio no activado: ' + e.message); }
+};
+async function play(m) {
+  const t0 = performance.now();
+  console.log('[KLIK receiver] 1/4 orden recibida:', m.id, m.file, 'vol', m.volume);
+  if (ctx && ctx.state === 'suspended') await ctx.resume().catch(() => {});
+  if (!audioReady()) throw new KErr('audio', 'Audio no activado: pulsa "Activar audio" en el receptor (el navegador lo suspendió)');
+  const buf = await getBuffer(m.file);
+  console.log('[KLIK receiver] 2/4 audio listo (' + buf.duration.toFixed(1) + ' s)');
+  if (!(m.volume > 0) || !(master.gain.value > 0)) console.warn('[KLIK receiver] volumen en 0: no se oirá nada (individual ' + m.volume + '%, general ' + Math.round(master.gain.value * 100) + '%)');
+  diag = null; ui();
+  const src = ctx.createBufferSource(), g = ctx.createGain();
+  src.buffer = buf; g.gain.value = m.volume / 100;
+  src.connect(g).connect(master); active.add(src);
+  src.onended = () => active.delete(src);
+  src.start();
+  console.log('[KLIK receiver] 3/4 reproduciendo');
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'receiver.played', id: m.id, file: m.file, ms: Math.round(performance.now() - t0) }));
+}
+function stopAll() { active.forEach((s) => { try { s.stop(); } catch {} }); active.clear(); }
+
+// ---- UI + WebSocket ----
+function ui() {
+  const wsOk = ws?.readyState === 1;
+  $('l-tab').textContent = !wsOk ? '🔴 WebSocket desconectado' : st?.tablets ? '🟢 Tablet conectada' : '🔴 Tablet desconectada';
+  $('l-dis').textContent = st?.discord?.connected ? '🎙️ Discord Web conectado' : '🎙️ Discord Web no conectado';
+  $('l-snd').textContent = audioReady() ? '🟢 Soundboard listo' : '🔴 Audio no activado';
+  $('l-err').hidden = !diag; if (diag) $('l-err').textContent = '🔴 ' + diag.msg;
+  const sto = st?.storage, stoMsg = !sto ? '' : sto.cloudError ? `🔴 Respaldo en la nube con problemas: ${sto.cloudError}` : (sto.cloud && !sto.cloudReady) ? '🟡 Conectando con el almacenamiento en la nube…' : sto.missing ? `🔴 ${sto.missing} sonido(s) configurado(s) NO existen en el servidor. Súbelos de nuevo.` : (!sto.persistent ? '⚠️ El servidor no tiene disco persistente: los sonidos subidos se pierden al reiniciar Render.' : '');
+  $('l-sto').hidden = !stoMsg; $('l-sto').textContent = stoMsg;
+  $('act').style.display = audioReady() ? 'none' : '';
+  if (st?.last) $('last').textContent = `${st.last.emoji} ${st.last.name}`;
+}
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?key=${encodeURIComponent(key)}&role=receiver`);
+  ws.onopen = () => { console.log('[KLIK receiver] WebSocket conectado'); $('net').textContent = '🟢 WebSocket conectado'; status(); };
+  ws.onclose = (e) => { console.warn('[KLIK receiver] WebSocket cerrado', e.code); st = null; $('net').textContent = e.code === 4001 ? '🔴 PIN incorrecto' : '🔴 WebSocket desconectado — reconectando…'; ui(); if (e.code !== 4001) setTimeout(connect, 1500); };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'state') { st = m.state; ui(); }
+    if (m.type === 'config') { config = m.config; if (master) master.gain.value = config.master / 100; syncCache(); }
+    if (m.type === 'play') play(m).catch((err) => fail(err.kind || 'play', err.message, true, m.file));
+    if (m.type === 'stop') stopAll();
+  };
+}
+connect(); ui();
+</script>
+</body>
+</html>
