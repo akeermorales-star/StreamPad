@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyDeck Receiver</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  body{align-items:center;justify-content:center;text-align:center;gap:18px;overflow:auto}
+  h1{font-size:clamp(28px,5vw,48px);letter-spacing:2px;margin:0}
+  .line{font-size:clamp(20px,3vw,30px)}
+  #last{font-size:clamp(28px,5vw,48px);margin-top:10px}
+  #act{background:var(--ac);border-radius:18px;padding:18px 28px;font-size:22px;font-weight:700}
+</style>
+</head>
+<body>
+<h1>MYDECK RECEIVER</h1>
+<div class="line" id="l-tab">🔴 Tablet desconectada</div>
+<div class="line" id="l-dis">🎙️ Discord no conectado</div>
+<div class="line" id="l-snd">🔇 Soundboard sin audio activado</div>
+<button id="act">🔊 Activar audio (obligatorio, un clic)</button>
+<div class="mut">Última acción:</div>
+<div id="last">—</div>
+<div class="mut" id="net">Conectando…</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const key = new URLSearchParams(location.search).get('key') || localStorage.getItem('mydeckKey') || prompt('PIN de MyDeck') || '';
+localStorage.setItem('mydeckKey', key);
+let ws, config = null, ctx = null, master = null, st = null;
+const active = new Set(), buffers = new Map();
+
+// ---- IndexedDB: caché local de los audios en esta computadora ----
+const idb = new Promise((res, rej) => { const r = indexedDB.open('mydeck-audio', 1); r.onupgradeneeded = () => r.result.createObjectStore('files', { keyPath: 'file' }); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const tx = async (mode, fn) => { const db = await idb; return new Promise((res, rej) => { const q = fn(db.transaction('files', mode).objectStore('files')); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+
+async function getBuffer(file) {
+  if (buffers.has(file)) return buffers.get(file);
+  let rec = await tx('readonly', (s) => s.get(file));
+  let data = rec?.data;
+  if (!data) {
+    const r = await fetch('/sounds/' + encodeURIComponent(file) + '?key=' + encodeURIComponent(key));
+    if (!r.ok) throw new Error('No se pudo descargar ' + file);
+    data = await r.arrayBuffer();
+    await tx('readwrite', (s) => s.put({ file, data }));
+  }
+  const buf = await ctx.decodeAudioData(data.slice(0));
+  buffers.set(file, buf);
+  return buf;
+}
+async function syncCache() {
+  if (!config) return;
+  const files = config.slots.map((s) => s.file).filter(Boolean);
+  const stored = await tx('readonly', (s) => s.getAllKeys());
+  for (const k of stored) if (!files.includes(k)) { await tx('readwrite', (s) => s.delete(k)); buffers.delete(k); }
+  if (ctx) for (const f of files) getBuffer(f).catch((e) => console.warn(e.message));
+}
+
+// ---- Audio ----
+const audioReady = () => !!ctx && ctx.state === 'running';
+function status() { ws?.readyState === 1 && ws.send(JSON.stringify({ type: 'receiver.status', audioReady: audioReady() })); ui(); }
+$('act').onclick = async () => {
+  ctx = ctx || new (window.AudioContext || window.webkitAudioContext)();
+  master = master || ctx.createGain(); master.connect(ctx.destination);
+  master.gain.value = (config?.master ?? 100) / 100;
+  await ctx.resume();
+  ctx.onstatechange = status;
+  await syncCache(); status();
+};
+async function play(m) {
+  if (!audioReady()) return;
+  const buf = await getBuffer(m.file);
+  const src = ctx.createBufferSource(), g = ctx.createGain();
+  src.buffer = buf; g.gain.value = m.volume / 100;
+  src.connect(g).connect(master); active.add(src);
+  src.onended = () => active.delete(src);
+  src.start();
+}
+function stopAll() { active.forEach((s) => { try { s.stop(); } catch {} }); active.clear(); }
+
+// ---- UI + WebSocket ----
+function ui() {
+  $('l-tab').textContent = st?.tablets ? '🟢 Tablet conectada' : '🔴 Tablet desconectada';
+  $('l-dis').textContent = st?.discord?.connected ? '🎙️ Discord conectado' : '🎙️ Discord no conectado';
+  $('l-snd').textContent = audioReady() ? '🔊 Soundboard listo' : '🔇 Soundboard sin audio activado';
+  $('act').style.display = audioReady() ? 'none' : '';
+  if (st?.last) $('last').textContent = `${st.last.emoji} ${st.last.name}`;
+}
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?key=${encodeURIComponent(key)}&role=receiver`);
+  ws.onopen = () => { $('net').textContent = '● Conectado al agente'; status(); };
+  ws.onclose = (e) => { $('net').textContent = e.code === 4001 ? 'PIN incorrecto' : 'Reconectando…'; if (e.code !== 4001) setTimeout(connect, 1500); };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'state') { st = m.state; ui(); }
+    if (m.type === 'config') { config = m.config; if (master) master.gain.value = config.master / 100; syncCache(); }
+    if (m.type === 'play') play(m).catch((err) => { $('net').textContent = '⚠️ ' + err.message; });
+    if (m.type === 'stop') stopAll();
+  };
+}
+connect(); ui();
+</script>
+</body>
+</html>
